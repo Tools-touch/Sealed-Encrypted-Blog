@@ -29,7 +29,7 @@ const ProposalView = () => {
       <div className="rounded-2xl bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 text-white p-6 shadow-xl">
         <h1 className="text-3xl font-bold mb-2">文章广场</h1>
         <p className="text-sm opacity-90">
-          浏览最新文章，查看加密正文并参与讨论/投票。
+          浏览最新文章，查看加密正文并参与讨论/点赞。
         </p>
       </div>
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">

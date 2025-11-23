@@ -1,7 +1,7 @@
 # Sealed Encrypted Blog 部署指南（中文）
 
 ## 一、项目结构
-- `contracts/`：Move 智能合约（投票与 Dashboard）。
+- `contracts/`：Move 智能合约（发布文章与 Dashboard）。
 - `frontend/`：Vite + React 前端（含 Walrus 存储、Seal 加密）。
 
 ## 二、环境要求
