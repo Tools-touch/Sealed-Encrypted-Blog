@@ -107,9 +107,10 @@ const CreateArticleView = () => {
     let contentKeyEncrypted: Uint8Array = new Uint8Array();
     let walrusPayload = content.trim();
     console.log(walrusPayload);
-    toast.info("正文加密中");
+    
     if (isRestricted) {
       try {
+        toast.info("正文加密中");
         const { cryptoKey, rawKey } = await generateAesKey();
         walrusPayload = await encryptToBase64(content.trim(), cryptoKey);
         

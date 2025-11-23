@@ -1,5 +1,5 @@
 import { useNavigation } from "../providers/navigation/NavigationContext";
-import { ConnectButton, useCurrentAccount } from "@mysten/dapp-kit";
+import { ConnectButton, useCurrentAccount, useSuiClientContext } from "@mysten/dapp-kit";
 
 function copy(text: string) {
   if (!text) return;
@@ -9,6 +9,7 @@ function copy(text: string) {
 const Navbar = () => {
   const { currentPage, navigate } = useNavigation();
   const account = useCurrentAccount();
+  const { network, networks, selectNetwork } = useSuiClientContext();
 
   const shorten = (addr: string) => {
     if (!addr) return "";
@@ -58,6 +59,26 @@ const Navbar = () => {
               </button>
             </div>
           )}
+          <div className="flex items-center gap-2 px-3 py-2 bg-white/15 border border-white/30 rounded-xl text-white shadow-md backdrop-blur transition hover:bg-white/25 hover:shadow-lg">
+            <span className="text-xs uppercase tracking-wide opacity-80">网络</span>
+            <div className="relative">
+              <select
+                className="appearance-none bg-white/90 text-indigo-800 pr-8 pl-3 py-1.5 rounded-lg text-sm font-semibold shadow focus:outline-none focus:ring-2 focus:ring-amber-300 focus:ring-offset-2 focus:ring-offset-indigo-500 transition"
+                value={network}
+                onChange={(e) => selectNetwork(e.target.value)}
+                title="切换 Sui 网络"
+              >
+                {Object.keys(networks).map((key) => (
+                  <option key={key} value={key} className="text-gray-800">
+                    {key}
+                  </option>
+                ))}
+              </select>
+              <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-xs text-indigo-700">
+                ▼
+              </span>
+            </div>
+          </div>
           <ConnectButton />
         </div>
       </div>

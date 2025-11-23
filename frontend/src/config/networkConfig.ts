@@ -18,14 +18,7 @@ import {
 
 
 const { networkConfig, useNetworkVariable } = createNetworkConfig({
-  localnet: {
-    url: getFullnodeUrl("localnet"),
-    variables: {
-      dashboardId: LOCAL_DASHBOARD_ID,
-      packageId: LOCAL_PACKAGE_ID,
-      adminCapId: LOCAL_ADMIN_CAP,
-    }
-  },
+
   devnet: {
     url: getFullnodeUrl("devnet"),
     variables: {

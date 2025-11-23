@@ -8,7 +8,7 @@ export const useVoteNfts = () => {
   return useSuiClientQuery(
     "getOwnedObjects",
     {
-      owner: account?.address,
+      owner: account?.address ?? "",
       options: {
         showContent: true
       },

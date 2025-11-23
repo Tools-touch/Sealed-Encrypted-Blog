@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSuiClient, useSuiClientQuery, useCurrentAccount, useSignAndExecuteTransaction, useSignPersonalMessage } from "@mysten/dapp-kit";
 import { Transaction } from "@mysten/sui/transactions";
 import { toast } from "react-toastify";
@@ -36,6 +36,9 @@ function ProposalDetailView() {
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [isUploadingImage, setIsUploadingImage] = useState(false);
   const [isDecrypting, setIsDecrypting] = useState(false);
+  // Avoid duplicate fetch in React StrictMode dev double-invoke while still allowing refresh when deps change
+  const contentFetchKeyRef = useRef<string | null>(null);
+  const commentsFetchKeyRef = useRef<string | null>(null);
 
   const { data, error, isPending, refetch } = useSuiClientQuery(
     "getObject",
@@ -46,17 +49,18 @@ function ProposalDetailView() {
     { enabled: !!proposalId }
   );
 
-  if (!proposalId) {
-    return <div className="text-red-500">无效的文章 ID</div>;
-  }
-
-  if (isPending) return <div className="text-center text-gray-500">加载中...</div>;
-  if (error) return <div className="text-red-500">加载失败: {error.message}</div>;
-  if (!data?.data) return <div className="text-red-500">未找到文章</div>;
-
-  const proposal = parseProposal(data.data);
+  // 确保 hooks 顺序固定，渲染分支放在 hooks 之后
+  const proposal = useMemo(
+    () => (data?.data ? parseProposal(data.data) : null),
+    [data?.data]
+  );
 
   useEffect(() => {
+    // --- 必须先判断必要数据是否存在，否则 useEffect 会因 undefined 而崩溃 ---
+    if (!suiClient) return;
+    if (!proposalId) return;
+    if (!proposal) return;
+
     if (!proposal?.contentBlobId) {
       setWalrusContent("");
       setContentError("");
@@ -64,25 +68,52 @@ function ProposalDetailView() {
       return;
     }
 
+    // -------------------------------------------------------------------
+
     setIsContentLoading(true);
     setContentError("");
+
+    const fetchKey = [
+      proposalId,
+      proposal?.contentBlobId ?? "",
+      proposal?.visibility ?? "",
+      proposal?.contentKeyEncrypted ?? "",
+      proposal?.sealId ?? "",
+      account?.address ?? "",
+      packageId ?? "",
+    ].join("|");
+    if (import.meta.env.DEV && contentFetchKeyRef.current === fetchKey) {
+      return;
+    }
+    contentFetchKeyRef.current = fetchKey;
+
     fetchWalrusContent(proposal.contentBlobId)
       .then(async (raw) => {
+        // 公开内容
         if (proposal.visibility === "Public") {
           setWalrusContent(raw);
           return;
         }
-        // 受限：需要解密
+
+        // 受限内容，需要解密
         if (!proposal.contentKeyEncrypted || !proposal.sealId) {
           throw new Error("缺少加密密钥或 Seal Id");
         }
-        if (!account?.address || !packageId) {
+
+        if (!account?.address) {
           throw new Error("请先连接钱包以解密受限内容");
         }
 
+        if (!packageId) {
+          throw new Error("缺少 packageId 配置");
+        }
+
         setIsDecrypting(true);
+
+        // ---- Seal session ----
         const sealClient = createSealClient(suiClient);
         const sessionKey = await createSessionKey(account.address, packageId, suiClient);
+
         const message = sessionKey.getPersonalMessage();
 
         await new Promise<void>((resolve, reject) => {
@@ -93,16 +124,20 @@ function ProposalDetailView() {
               onSuccess: ({ signature }) => {
                 sessionKey.setPersonalMessageSignature(signature);
                 resolve();
-              },
+              }
             }
           );
         });
 
-        // 构建只调用 seal_approve 的 txBytes
-        const sealIdBytes = typeof proposal.sealId === "string" ? fromHEX(proposal.sealId) : new Uint8Array();
+        const sealIdBytes =
+          typeof proposal.sealId === "string"
+            ? fromHEX(proposal.sealId)
+            : new Uint8Array();
+
         if (sealIdBytes.length === 0) {
           throw new Error("缺少加密密钥或 Seal Id");
         }
+
         const tx = new Transaction();
         tx.moveCall({
           target: `${packageId}::proposal::seal_approve`,
@@ -111,7 +146,12 @@ function ProposalDetailView() {
             tx.object(proposalId),
           ],
         });
-        const txBytes = await tx.build({ client: suiClient, onlyTransactionKind: true });
+
+        // --- 必须保证 client 存在，否则 build 会崩溃 ---
+        const txBytes = await tx.build({
+          client: suiClient,
+          onlyTransactionKind: true,
+        });
 
         const encryptedBytes = fromBase64(proposal.contentKeyEncrypted);
         const decryptedKeyBytes = await sealClient.decrypt({
@@ -119,19 +159,30 @@ function ProposalDetailView() {
           sessionKey,
           txBytes,
         });
+
         const aesKey = await importAesKey(decryptedKeyBytes);
         const plain = await decryptFromBase64(raw, aesKey);
         setWalrusContent(plain);
       })
       .catch((err) => {
-        console.error(err);
+        console.error("Content load error:", err);
         setContentError(err instanceof Error ? err.message : "文章内容加载失败");
       })
       .finally(() => {
         setIsContentLoading(false);
         setIsDecrypting(false);
       });
-  }, [proposal?.contentBlobId, proposal?.visibility, proposal?.contentKeyEncrypted, proposal?.sealId, account?.address, packageId, proposalId]);
+  }, [
+    suiClient,
+    proposal,
+    proposalId,
+    account?.address,
+    packageId,
+    proposal?.contentBlobId,
+    proposal?.visibility,
+    proposal?.contentKeyEncrypted,
+    proposal?.sealId,
+  ]);
 
   useEffect(() => {
     const fetchComments = async () => {
@@ -139,6 +190,11 @@ function ProposalDetailView() {
         setCommentBodies({});
         return;
       }
+      const commentsKey = proposal.comments.map((c, idx) => `${c.author}-${c.timestamp}-${idx}-${c.contentBlobId}`).join("|");
+      if (import.meta.env.DEV && commentsFetchKeyRef.current === commentsKey) {
+        return;
+      }
+      commentsFetchKeyRef.current = commentsKey;
       const entries = proposal.comments.map((c, idx) => ({
         key: `${c.author}-${c.timestamp}-${idx}`,
         blobId: c.contentBlobId,
@@ -159,9 +215,16 @@ function ProposalDetailView() {
       setCommentBodies(newBodies);
     };
     fetchComments();
-    // 仅在评论列表内容（作者+时间+blobId）变化时触发
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+
   }, [proposal?.comments?.map((c, idx) => `${c.author}-${c.timestamp}-${idx}-${c.contentBlobId}`).join("|")]);
+
+  if (!proposalId) {
+    return <div className="text-red-500">无效的文章 ID</div>;
+  }
+
+  if (isPending) return <div className="text-center text-gray-500">加载中...</div>;
+  if (error) return <div className="text-red-500">加载失败: {error.message}</div>;
+  if (!data?.data) return <div className="text-red-500">未找到文章</div>;
 
   if (!proposal) return <div className="text-red-500">解析文章数据失败</div>;
 
@@ -248,9 +311,9 @@ function ProposalDetailView() {
     });
 
     toast.info("删除交易提交中...");
-      signAndExecute(
-        { transaction: tx as any },
-        {
+    signAndExecute(
+      { transaction: tx as any },
+      {
         onError: (err) => {
           console.error(err);
           toast.error("删除失败");
@@ -285,17 +348,17 @@ function ProposalDetailView() {
       ],
     });
 
-    toast.info("提交投票中...");
-      signAndExecute(
-        { transaction: tx as any },
-        {
+    toast.info("提交点赞中...");
+    signAndExecute(
+      { transaction: tx as any },
+      {
         onError: (err) => {
           console.error(err);
-          toast.error("投票失败");
+          toast.error("点赞失败");
         },
         onSuccess: async ({ digest }) => {
           await suiClient.waitForTransaction({ digest, options: { showEffects: true } });
-          toast.success("投票成功");
+          toast.success("点赞成功");
           refetch();
         },
       }
@@ -394,9 +457,9 @@ function ProposalDetailView() {
         tx.pure.u64(newExpiration),
       ],
     });
-      signAndExecute(
-        { transaction: tx as any },
-        {
+    signAndExecute(
+      { transaction: tx as any },
+      {
         onError: (err) => {
           console.error(err);
           toast.error("更新失败");
@@ -495,143 +558,143 @@ function ProposalDetailView() {
               )}
             </div>
           </div>
-        {isEditing ? (
-          <div className="space-y-3 mb-4">
-            <div className="flex gap-4">
-              <label className="flex items-center gap-2 text-sm">
-                <input
-                  type="radio"
-                  checked={editVisibility === "Public"}
-                  onChange={() => setEditVisibility("Public")}
-                  disabled={isSigning || isUploadingContent}
-                />
-                公开可见
-              </label>
-              <label className="flex items-center gap-2 text-sm">
-                <input
-                  type="radio"
-                  checked={editVisibility === "Restricted"}
-                  onChange={() => setEditVisibility("Restricted")}
-                  disabled={isSigning || isUploadingContent}
-                />
-                指定地址可见
-              </label>
-            </div>
-            {editVisibility === "Restricted" && (
-              <div>
-                <label className="block text-sm font-medium mb-1" htmlFor="allowed-edit">
-                  可见地址（逗号分隔）
+          {isEditing ? (
+            <div className="space-y-3 mb-4">
+              <div className="flex gap-4">
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="radio"
+                    checked={editVisibility === "Public"}
+                    onChange={() => setEditVisibility("Public")}
+                    disabled={isSigning || isUploadingContent}
+                  />
+                  公开可见
                 </label>
-                <input
-                  id="allowed-edit"
-                  type="text"
-                  value={editAllowedInput}
-                  onChange={(e) => setEditAllowedInput(e.target.value)}
-                  disabled={isSigning || isUploadingContent}
-                  placeholder="0xabc...,0xdef..."
-                  className="w-full rounded border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-2"
-                />
-                <p className="text-xs text-gray-500 mt-1">作者地址会自动加入</p>
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="radio"
+                    checked={editVisibility === "Restricted"}
+                    onChange={() => setEditVisibility("Restricted")}
+                    disabled={isSigning || isUploadingContent}
+                  />
+                  指定地址可见
+                </label>
               </div>
-            )}
-            <input
-              className="w-full rounded border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              value={editTitle}
-              onChange={(e) => setEditTitle(e.target.value)}
-              placeholder="标题"
-              disabled={isSigning || isUploadingContent}
-            />
-            <input
-              className="w-full rounded border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              value={editSummary}
-              onChange={(e) => setEditSummary(e.target.value)}
-              placeholder="摘要（上链保存）"
-              disabled={isSigning || isUploadingContent}
-            />
-            <textarea
-              className="w-full rounded border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              rows={6}
-              value={editContent}
-              onChange={(e) => setEditContent(e.target.value)}
-              placeholder="内容（支持 Markdown）"
-              disabled={isSigning || isUploadingContent}
-            />
-            <div className="flex items-center gap-3 text-sm">
+              {editVisibility === "Restricted" && (
+                <div>
+                  <label className="block text-sm font-medium mb-1" htmlFor="allowed-edit">
+                    可见地址（逗号分隔）
+                  </label>
+                  <input
+                    id="allowed-edit"
+                    type="text"
+                    value={editAllowedInput}
+                    onChange={(e) => setEditAllowedInput(e.target.value)}
+                    disabled={isSigning || isUploadingContent}
+                    placeholder="0xabc...,0xdef..."
+                    className="w-full rounded border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-2"
+                  />
+                  <p className="text-xs text-gray-500 mt-1">作者地址会自动加入</p>
+                </div>
+              )}
               <input
-                type="file"
-                accept="image/*"
-                onChange={(e) => setImageFile(e.target.files?.[0] || null)}
-                disabled={isSigning || isUploadingImage || isUploadingContent}
-              />
-              <button
-                className="px-3 py-1 rounded border border-gray-500 disabled:opacity-50"
-                type="button"
-                onClick={handleImageUpload}
-                disabled={isSigning || isUploadingImage || isUploadingContent}
-              >
-                {isUploadingImage ? "上传图片中..." : "上传图片并插入 Markdown"}
-              </button>
-            </div>
-            <div className="text-sm text-gray-500 dark:text-gray-400">
-              正文会先上传到海象存储，摘要直接上链。过期时间将自动更新为 30 天后。
-            </div>
-            <div className="flex gap-3">
-              <button
-                className="px-3 py-1 rounded bg-blue-500 text-white hover:bg-blue-600"
-                onClick={handleSaveEdit}
+                className="w-full rounded border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                value={editTitle}
+                onChange={(e) => setEditTitle(e.target.value)}
+                placeholder="标题"
                 disabled={isSigning || isUploadingContent}
+              />
+              <input
+                className="w-full rounded border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                value={editSummary}
+                onChange={(e) => setEditSummary(e.target.value)}
+                placeholder="摘要（上链保存）"
+                disabled={isSigning || isUploadingContent}
+              />
+              <textarea
+                className="w-full rounded border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                rows={6}
+                value={editContent}
+                onChange={(e) => setEditContent(e.target.value)}
+                placeholder="内容（支持 Markdown）"
+                disabled={isSigning || isUploadingContent}
+              />
+              <div className="flex items-center gap-3 text-sm">
+                <input
+                  type="file"
+                  accept="image/*"
+                  onChange={(e) => setImageFile(e.target.files?.[0] || null)}
+                  disabled={isSigning || isUploadingImage || isUploadingContent}
+                />
+                <button
+                  className="px-3 py-1 rounded border border-gray-500 disabled:opacity-50"
+                  type="button"
+                  onClick={handleImageUpload}
+                  disabled={isSigning || isUploadingImage || isUploadingContent}
+                >
+                  {isUploadingImage ? "上传图片中..." : "上传图片并插入 Markdown"}
+                </button>
+              </div>
+              <div className="text-sm text-gray-500 dark:text-gray-400">
+                正文会先上传到海象存储，摘要直接上链。过期时间将自动更新为 30 天后。
+              </div>
+              <div className="flex gap-3">
+                <button
+                  className="px-3 py-1 rounded bg-blue-500 text-white hover:bg-blue-600"
+                  onClick={handleSaveEdit}
+                  disabled={isSigning || isUploadingContent}
+                >
+                  {isUploadingContent ? "上传中..." : "保存修改"}
+                </button>
+                <button
+                  className="px-3 py-1 rounded border border-gray-500"
+                  onClick={() => setIsEditing(false)}
+                >
+                  取消
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-2 mb-4">
+              <p className="text-sm text-gray-500 dark:text-gray-400">
+                摘要：{proposal.description || "暂无摘要"}
+              </p>
+              {isContentLoading ? (
+                <div className="text-gray-500">正文从海象加载中...</div>
+              ) : isDecrypting ? (
+                <div className="text-gray-500">受限内容解密中...</div>
+              ) : contentError ? (
+                <div className="text-red-500">{contentError}</div>
+              ) : (
+                <div className="prose prose-slate dark:prose-invert max-w-none">
+                  {walrusContent ? (
+                    <ReactMarkdown>{walrusContent}</ReactMarkdown>
+                  ) : (
+                    <p className="text-gray-500 dark:text-gray-400">暂无正文</p>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          <div className="flex gap-4 text-sm text-gray-600 dark:text-gray-300 items-center flex-wrap">
+            <div className="flex gap-2">
+              <button
+                className="inline-flex items-center gap-1 px-3 py-1 rounded-full bg-indigo-100 text-indigo-700 dark:bg-indigo-900/70 dark:text-indigo-200 hover:shadow disabled:opacity-60"
+                onClick={() => handleVote(true)}
+                disabled={isExpired || isDelisted || isSigning}
               >
-                {isUploadingContent ? "上传中..." : "保存修改"}
+                👍 <span className="font-semibold">{proposal.votedYesCount}</span>
               </button>
               <button
-                className="px-3 py-1 rounded border border-gray-500"
-                onClick={() => setIsEditing(false)}
+                className="inline-flex items-center gap-1 px-3 py-1 rounded-full bg-amber-100 text-amber-700 dark:bg-amber-900/70 dark:text-amber-200 hover:shadow disabled:opacity-60"
+                onClick={() => handleVote(false)}
+                disabled={isExpired || isDelisted || isSigning}
               >
-                取消
+                👎 <span className="font-semibold">{proposal.votedNoCount}</span>
               </button>
             </div>
-          </div>
-        ) : (
-          <div className="space-y-2 mb-4">
-            <p className="text-sm text-gray-500 dark:text-gray-400">
-              摘要：{proposal.description || "暂无摘要"}
-            </p>
-            {isContentLoading ? (
-              <div className="text-gray-500">正文从海象加载中...</div>
-            ) : isDecrypting ? (
-              <div className="text-gray-500">受限内容解密中...</div>
-            ) : contentError ? (
-              <div className="text-red-500">{contentError}</div>
-            ) : (
-              <div className="prose prose-slate dark:prose-invert max-w-none">
-                {walrusContent ? (
-                  <ReactMarkdown>{walrusContent}</ReactMarkdown>
-                ) : (
-                  <p className="text-gray-500 dark:text-gray-400">暂无正文</p>
-                )}
-              </div>
-            )}
-          </div>
-        )}
-        
-        <div className="flex gap-4 text-sm text-gray-600 dark:text-gray-300 items-center flex-wrap">
-          <div className="flex gap-2">
-            <button
-              className="inline-flex items-center gap-1 px-3 py-1 rounded-full bg-indigo-100 text-indigo-700 dark:bg-indigo-900/70 dark:text-indigo-200 hover:shadow disabled:opacity-60"
-              onClick={() => handleVote(true)}
-              disabled={isExpired || isDelisted || isSigning}
-            >
-              👍 <span className="font-semibold">{proposal.votedYesCount}</span>
-            </button>
-            <button
-              className="inline-flex items-center gap-1 px-3 py-1 rounded-full bg-amber-100 text-amber-700 dark:bg-amber-900/70 dark:text-amber-200 hover:shadow disabled:opacity-60"
-              onClick={() => handleVote(false)}
-              disabled={isExpired || isDelisted || isSigning}
-            >
-              👎 <span className="font-semibold">{proposal.votedNoCount}</span>
-            </button>
-          </div>
-          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-white/70 dark:bg-gray-800 text-gray-700 dark:text-gray-200 border border-gray-200 dark:border-gray-700 shadow-sm">
+            {/* <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-white/70 dark:bg-gray-800 text-gray-700 dark:text-gray-200 border border-gray-200 dark:border-gray-700 shadow-sm">
             <span className="text-xs text-gray-500">作者</span>
             <button
               className="font-mono underline decoration-dotted hover:text-indigo-500"
@@ -640,77 +703,77 @@ function ProposalDetailView() {
             >
               {formatAddress(proposal.creator)}
             </button>
+          </div> */}
+            <span className="px-2 py-1 rounded-full bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-200">
+              状态: {isExpired ? "已过期" : "进行中"}
+            </span>
+            <span className="px-2 py-1 rounded-full bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-200">
+              可见性: {proposal.visibility === "Public" ? "公开" : "指定地址"}
+            </span>
+            {proposal.visibility === "Restricted" && (
+              <span className="text-xs text-gray-500">受限正文需解密</span>
+            )}
+            {!account && (
+              <span className="text-red-500">请连接钱包以操作</span>
+            )}
           </div>
-          <span className="px-2 py-1 rounded-full bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-200">
-            状态: {isExpired ? "已过期" : "进行中"}
-          </span>
-          <span className="px-2 py-1 rounded-full bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-200">
-            可见性: {proposal.visibility === "Public" ? "公开" : "指定地址"}
-          </span>
-          {proposal.visibility === "Restricted" && (
-            <span className="text-xs text-gray-500">受限正文需解密</span>
-          )}
-          {!account && (
-            <span className="text-red-500">请连接钱包以操作</span>
-          )}
-        </div>
-      </div>
-
-      <div className="bg-white dark:bg-gray-900/80 border border-gray-200 dark:border-gray-700 p-6 rounded-2xl shadow-xl backdrop-blur space-y-4">
-        <div className="flex items-center justify-between">
-          <h2 className="text-2xl font-semibold">评论</h2>
-          <span className="text-sm text-gray-500">共 {proposal.comments.length} 条</span>
         </div>
 
-        <div className="space-y-2">
-          {proposal.comments.length === 0 && (
-            <div className="text-gray-500">暂无评论</div>
-          )}
-          {proposal.comments.map((c, idx) => {
-            const key = `${c.author}-${c.timestamp}-${idx}`;
-            const body = commentBodies[key];
-            return (
-              <div key={key} className="border border-gray-200 dark:border-gray-700 rounded-xl p-3 bg-white/70 dark:bg-gray-900/60">
-                <div className="flex items-center justify-between text-sm text-gray-500 mb-2">
-                  <div className="inline-flex items-center gap-2 px-2 py-1 rounded-full bg-indigo-50 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-100 border border-indigo-100 dark:border-indigo-800">
-                    <span className="text-xs text-gray-500">评论者</span>
-                    <button
-                      className="font-mono underline decoration-dotted hover:text-indigo-400"
-                      onClick={() => copyToClipboard(c.author)}
-                      title="点击复制地址"
-                    >
-                      {formatAddress(c.author)}
-                    </button>
+        <div className="bg-white dark:bg-gray-900/80 border border-gray-200 dark:border-gray-700 p-6 rounded-2xl shadow-xl backdrop-blur space-y-4">
+          <div className="flex items-center justify-between">
+            <h2 className="text-2xl font-semibold">评论</h2>
+            <span className="text-sm text-gray-500">共 {proposal.comments.length} 条</span>
+          </div>
+
+          <div className="space-y-2">
+            {proposal.comments.length === 0 && (
+              <div className="text-gray-500">暂无评论</div>
+            )}
+            {proposal.comments.map((c, idx) => {
+              const key = `${c.author}-${c.timestamp}-${idx}`;
+              const body = commentBodies[key];
+              return (
+                <div key={key} className="border border-gray-200 dark:border-gray-700 rounded-xl p-3 bg-white/70 dark:bg-gray-900/60">
+                  <div className="flex items-center justify-between text-sm text-gray-500 mb-2">
+                    <div className="inline-flex items-center gap-2 px-2 py-1 rounded-full bg-indigo-50 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-100 border border-indigo-100 dark:border-indigo-800">
+                      <span className="text-xs text-gray-500">评论者</span>
+                      <button
+                        className="font-mono underline decoration-dotted hover:text-indigo-400"
+                        onClick={() => copyToClipboard(c.author)}
+                        title="点击复制地址"
+                      >
+                        {formatAddress(c.author)}
+                      </button>
+                    </div>
+                    <span className="text-xs text-gray-500">{formatUnixTime(c.timestamp)}</span>
                   </div>
-                  <span className="text-xs text-gray-500">{formatUnixTime(c.timestamp)}</span>
+                  <p className="text-gray-800 dark:text-gray-200 whitespace-pre-wrap">
+                    {body === undefined ? "加载中..." : body || "暂无内容"}
+                  </p>
                 </div>
-                <p className="text-gray-800 dark:text-gray-200 whitespace-pre-wrap">
-                  {body === undefined ? "加载中..." : body || "暂无内容"}
-                </p>
-              </div>
-            );
-          })}
-        </div>
+              );
+            })}
+          </div>
 
-        <div className="space-y-2">
-          <textarea
-            value={commentText}
-            onChange={(e) => setCommentText(e.target.value)}
-            placeholder={isExpired ? "文章已过期/下架，无法评论" : "写下你的看法..."}
-            disabled={isExpired || isDelisted || isSigning}
-            className="w-full rounded-xl border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:bg-gray-200 dark:disabled:bg-gray-700"
-            rows={4}
-          />
-          <button
-            onClick={handleComment}
-            disabled={isExpired || isDelisted || isSigning}
-            className="w-full bg-gradient-to-r from-indigo-500 to-purple-500 text-white py-3 px-4 rounded-xl hover:from-indigo-600 hover:to-purple-600 transition-all shadow disabled:from-gray-400 disabled:to-gray-500 disabled:cursor-not-allowed"
-          >
-            {isSigning ? "提交中..." : "发表评论"}
-          </button>
+          <div className="space-y-2">
+            <textarea
+              value={commentText}
+              onChange={(e) => setCommentText(e.target.value)}
+              placeholder={isExpired ? "文章已过期/下架，无法评论" : "写下你的看法..."}
+              disabled={isExpired || isDelisted || isSigning}
+              className="w-full rounded-xl border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:bg-gray-200 dark:disabled:bg-gray-700"
+              rows={4}
+            />
+            <button
+              onClick={handleComment}
+              disabled={isExpired || isDelisted || isSigning}
+              className="w-full bg-gradient-to-r from-indigo-500 to-purple-500 text-white py-3 px-4 rounded-xl hover:from-indigo-600 hover:to-purple-600 transition-all shadow disabled:from-gray-400 disabled:to-gray-500 disabled:cursor-not-allowed"
+            >
+              {isSigning ? "提交中..." : "发表评论"}
+            </button>
+          </div>
         </div>
       </div>
-    </div>
     </div>
   );
 }
@@ -797,7 +860,7 @@ function formatAddress(addr: string) {
 
 function copyToClipboard(text: string) {
   if (!text) return;
-  navigator.clipboard?.writeText(text).catch(() => {});
+  navigator.clipboard?.writeText(text).catch(() => { });
 }
 
 export default ProposalDetailView;
