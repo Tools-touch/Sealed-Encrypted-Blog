@@ -26,8 +26,8 @@ const Navbar = () => {
     <nav className="bg-gradient-to-r from-blue-600 via-indigo-600 to-purple-600 shadow-lg sticky top-0 z-20">
       <div className="max-w-screen-xl mx-auto px-4 py-3 flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3 text-white">
-          <div className="h-10 w-10 rounded-full bg-white/20 backdrop-blur flex items-center justify-center font-bold">
-            🗳️
+          <div className="h-10 w-10 rounded-full bg-white/80 backdrop-blur flex items-center justify-center font-bold">
+            <img src="/logo.png" alt="SEB" className="h-8 w-8 rounded-full" />
           </div>
           <div>
             <p className="text-lg font-semibold">SEB</p>
